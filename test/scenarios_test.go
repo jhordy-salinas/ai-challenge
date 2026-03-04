@@ -3,6 +3,7 @@ package test
 import (
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,6 +191,15 @@ func TestRetryScenarios(t *testing.T) {
 			expectedStatus:   model.StatusFailed,
 			expectedAttempts: 4,
 		},
+		{
+			name:    "13. Card expired -> abort immediately",
+			request: makeRequest("StripeLatam", "PayUSouth"),
+			responses: map[string][]processor.ScriptedResponse{
+				"StripeLatam": {{ErrorType: model.ErrCardExpired, ErrorMessage: "card expired"}},
+			},
+			expectedStatus:   model.StatusDeclined,
+			expectedAttempts: 1,
+		},
 	}
 
 	for _, tc := range tests {
@@ -255,6 +265,87 @@ func TestRetryScenarios(t *testing.T) {
 				t.Errorf("stored attempts = %d, want %d", len(stored.Attempts), tc.expectedAttempts)
 			}
 		})
+	}
+}
+
+func TestExponentialBackoffValues(t *testing.T) {
+	var mu sync.Mutex
+	var delays []time.Duration
+	capturingSleep := func(d time.Duration) {
+		mu.Lock()
+		delays = append(delays, d)
+		mu.Unlock()
+	}
+
+	s := store.New()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	sim := processor.NewScriptedSimulator(map[string][]processor.ScriptedResponse{
+		"StripeLatam": {
+			{ErrorType: model.ErrRateLimitExceeded, ErrorMessage: "rate limit"},
+			{ErrorType: model.ErrRateLimitExceeded, ErrorMessage: "rate limit"},
+			{ErrorType: model.ErrRateLimitExceeded, ErrorMessage: "rate limit"},
+			{Approved: true},
+		},
+	})
+	engine := retry.NewEngine(s, sim, nil, capturingSleep, logger)
+
+	txn, err := engine.Execute(makeRequest("StripeLatam"))
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if txn.Status != model.StatusApproved {
+		t.Errorf("status = %q, want approved", txn.Status)
+	}
+	if len(delays) != 3 {
+		t.Fatalf("got %d backoff delays, want 3", len(delays))
+	}
+
+	// Verify exponential progression with jitter tolerance (0-25% above base).
+	expectedBase := []time.Duration{500 * time.Millisecond, 1000 * time.Millisecond, 2000 * time.Millisecond}
+	for i, base := range expectedBase {
+		maxJitter := base / 4
+		if delays[i] < base || delays[i] > base+maxJitter {
+			t.Errorf("delay[%d] = %v, want between %v and %v", i, delays[i], base, base+maxJitter)
+		}
+	}
+}
+
+func TestHealthBasedProcessorReordering(t *testing.T) {
+	s := store.New()
+	tracker := health.NewTracker(5 * time.Minute)
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// Degrade StripeLatam's health: 5 timeouts.
+	for i := 0; i < 5; i++ {
+		tracker.Record("StripeLatam", false, true)
+	}
+	// PayUSouth is healthy: 5 successes.
+	for i := 0; i < 5; i++ {
+		tracker.Record("PayUSouth", true, false)
+	}
+
+	// Script: both processors succeed on first call.
+	sim := processor.NewScriptedSimulator(map[string][]processor.ScriptedResponse{
+		"PayUSouth":   {{Approved: true}},
+		"StripeLatam": {{Approved: true}},
+	})
+
+	engine := retry.NewEngine(s, sim, tracker, noopSleep, logger)
+
+	// Request with StripeLatam first, but health should reorder to PayUSouth first.
+	txn, err := engine.Execute(makeRequest("StripeLatam", "PayUSouth"))
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if txn.Status != model.StatusApproved {
+		t.Errorf("status = %q, want approved", txn.Status)
+	}
+	if txn.ProcessorUsed != "PayUSouth" {
+		t.Errorf("processor_used = %q, want PayUSouth (healthier)", txn.ProcessorUsed)
+	}
+	if len(txn.Attempts) != 1 {
+		t.Errorf("attempts = %d, want 1", len(txn.Attempts))
 	}
 }
 

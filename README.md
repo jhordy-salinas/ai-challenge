@@ -12,7 +12,8 @@ CloudMarket loses $15-20K/month from transactions that fail due to transient pro
 
 ```bash
 go run main.go
-# Server starts on :8080
+# Server starts on :8080 (override with PORT env var)
+# PORT=3000 go run main.go
 
 # Submit a transaction
 curl -X POST http://localhost:8080/transactions \
@@ -64,12 +65,19 @@ Creates a transaction and runs the retry orchestration loop synchronously.
 }
 ```
 
-**Validated fields:** `amount` (must be positive), `currency` (required), `payment_method` (required), `merchant_id` (required), `processor_order` (at least one). Returns `400 Bad Request` with error message if any validation fails.
+**Validated fields:** `amount` (must be positive), `currency` (required), `payment_method` (required), `merchant_id` (required), `processor_order` (at least one, must be known processors). Returns `400 Bad Request` with error message and machine-parseable `code` field if any validation fails.
+
+**Error response format:**
+```json
+{"error": "amount must be positive", "code": "INVALID_AMOUNT"}
+```
+
+Error codes: `INVALID_JSON`, `INVALID_AMOUNT`, `MISSING_CURRENCY`, `MISSING_PAYMENT_METHOD`, `MISSING_PROCESSOR_ORDER`, `MISSING_MERCHANT_ID`, `UNKNOWN_PROCESSOR`, `INTERNAL_ERROR`.
 
 | Status | Meaning |
 |--------|---------|
 | 200    | Transaction approved |
-| 400    | Validation error (missing/invalid fields) |
+| 400    | Validation error (missing/invalid fields, unknown processor) |
 | 422    | Hard decline (card expired, insufficient funds, etc.) |
 | 502    | All retries exhausted |
 
@@ -120,11 +128,19 @@ curl http://localhost:8080/transactions/txn_a1b2c3d4e5f6
 ```
 
 ### GET /transactions
-Returns a list of all transactions with full attempt history.
+Returns a list of all transactions with full attempt history. Supports optional pagination.
 
 ```bash
 curl http://localhost:8080/transactions
+curl http://localhost:8080/transactions?limit=10&offset=0
 ```
+
+| Param | Description |
+|-------|-------------|
+| `limit` | Maximum number of transactions to return (default: all) |
+| `offset` | Number of transactions to skip (default: 0) |
+
+Results are sorted by creation time (newest first).
 
 **Response (200):**
 ```json
@@ -182,8 +198,8 @@ curl http://localhost:8080/processors/health
 | `service_error`, `try_again_later` | Retry same processor | Temporary issue |
 | `insufficient_funds`, `card_expired`, `fraudulent_card`, `do_not_honor` | Abort immediately | Will never succeed |
 
-- **Max attempts:** 4 (initial + 3 retries)
-- **Exponential backoff:** 500ms → 1s → 2s
+- **Max attempts:** 4 (initial + 3 retries) — hardcoded constants in `retry/engine.go`
+- **Exponential backoff:** 500ms → 1s → 2s (with 0-25% random jitter to prevent thundering herd)
 - **Processor fallback:** Ordered list, advances on switch-processor errors
 - **Health-aware ordering:** Processors reordered by health score when tracker is enabled
 
@@ -226,7 +242,7 @@ go test ./... -v -race
 go test ./... -v -race -cover
 ```
 
-Test scenarios cover: immediate success, timeout-then-switch, rate-limit-then-retry, hard decline abort (insufficient funds, fraudulent card, do not honor), all-processors-exhausted, processor unavailable cascade, service error retry, try-again-later retry, rate limit exhaustion, mixed strategy chains, multi-currency (MXN, COP, CLP, USD), concurrent transaction isolation, and HTTP integration (status codes, JSON validation, error handling, `merchant_id` validation).
+Test scenarios cover: immediate success, timeout-then-switch, rate-limit-then-retry, hard decline abort (insufficient funds, card expired, fraudulent card, do not honor), all-processors-exhausted, processor unavailable cascade, service error retry, try-again-later retry, rate limit exhaustion, mixed strategy chains, multi-currency (MXN, COP, CLP, USD), exponential backoff value verification, health-based processor reordering, concurrent transaction isolation, pagination, processor name validation, error codes, and HTTP integration (status codes, JSON validation, error handling).
 
 ## Observability
 
@@ -236,3 +252,20 @@ All retry decisions are logged as structured JSON via `slog`:
 - HTTP request logging: method, path, status, duration, remote addr
 - Each attempt records `response_type`: `"approved"`, `"hard_decline"`, or `"soft_decline"`
 - Completed transactions include `completed_at` timestamp and `total_processing_time_ms`
+
+## Troubleshooting
+
+**Q: What does a 502 response mean?**
+A: All retry attempts were exhausted without a successful approval. Use `GET /transactions/{id}` to see the full attempt history — each attempt shows which processor failed and why.
+
+**Q: Why did I get a 422 instead of retrying?**
+A: The processor returned a hard decline (`insufficient_funds`, `card_expired`, `fraudulent_card`, `do_not_honor`). These are permanent errors that won't succeed on retry, so the engine aborts immediately.
+
+**Q: How do I use a custom port?**
+A: Set the `PORT` environment variable: `PORT=3000 go run main.go`
+
+**Q: How does health-based reordering work?**
+A: Processors are reordered by a composite health score (`success_rate - timeout_rate * 0.5`) computed over a 5-minute rolling window. Healthier processors are tried first. Unknown processors default to score 1.0.
+
+**Q: What if all processors are down?**
+A: The engine tries each processor in order, switching after timeouts or unavailability errors, and returns `502` with `"all processors exhausted"` once all have been attempted or max attempts reached.

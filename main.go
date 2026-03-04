@@ -23,7 +23,7 @@ func main() {
 	sim := processor.NewRealisticSimulator()
 	tracker := health.NewTracker(5 * time.Minute)
 	engine := retry.NewEngine(s, sim, tracker, nil, logger)
-	h := handler.New(engine, s, tracker)
+	h := handler.New(engine, s, tracker, []string{"StripeLatam", "PayUSouth", "EbanxBR"})
 	r := router.New(h, logger)
 
 	port := os.Getenv("PORT")

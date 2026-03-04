@@ -3,6 +3,7 @@ package retry
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"time"
 
 	"github.com/yuno/ai-challenge/internal/health"
@@ -12,8 +13,8 @@ import (
 )
 
 const (
-	MaxAttempts    = 4
-	BaseBackoffMs  = 500
+	MaxAttempts   = 4
+	BaseBackoffMs = 500
 )
 
 // SleepFunc is the delay function, injectable for testing.
@@ -43,6 +44,65 @@ func NewEngine(s *store.Store, sim processor.Simulator, h *health.Tracker, sleep
 		sleep:     sleep,
 		logger:    logger,
 	}
+}
+
+// attemptOutcome captures the result of executing a single processor attempt.
+type attemptOutcome struct {
+	attempt   model.Attempt
+	action    model.RetryAction
+	approved  bool
+	isTimeout bool
+}
+
+// runAttempt calls the processor and classifies the result.
+func (e *Engine) runAttempt(processorName string, amount float64, attemptNum int) attemptOutcome {
+	start := time.Now()
+	result := e.simulator.Process(processorName, amount)
+	elapsed := time.Since(start)
+
+	attempt := model.Attempt{
+		Number:     attemptNum,
+		Processor:  processorName,
+		Duration:   elapsed,
+		DurationMs: float64(elapsed.Nanoseconds()) / 1e6,
+		Timestamp:  time.Now(),
+	}
+
+	if result.Approved {
+		attempt.Status = "approved"
+		attempt.ResponseType = "approved"
+		return attemptOutcome{attempt: attempt, approved: true}
+	}
+
+	attempt.Status = "failed"
+	attempt.ErrorType = result.ErrorType
+	attempt.ErrorMessage = result.ErrorMessage
+
+	action, ok := model.RetryRules[result.ErrorType]
+	if !ok {
+		action = model.ActionAbort
+	}
+	attempt.RetryAction = action
+
+	if action == model.ActionAbort {
+		attempt.ResponseType = "hard_decline"
+	} else {
+		attempt.ResponseType = "soft_decline"
+	}
+
+	return attemptOutcome{
+		attempt:   attempt,
+		action:    action,
+		isTimeout: result.ErrorType == model.ErrTimeout,
+	}
+}
+
+// calcBackoff returns an exponential backoff duration with random jitter.
+// Formula: 500ms * 2^(attemptNum-1) + rand(0, 25% of base).
+func (e *Engine) calcBackoff(attemptNum int) time.Duration {
+	backoff := time.Duration(BaseBackoffMs*(1<<(attemptNum-1))) * time.Millisecond
+	jitter := time.Duration(rand.Int63n(int64(backoff / 4)))
+	return backoff + jitter
 }
 
 // Execute runs the full retry orchestration for a transaction request.
@@ -87,88 +147,50 @@ func (e *Engine) Execute(req model.TransactionRequest) (*model.Transaction, erro
 		}
 
 		currentProcessor := processors[processorIdx]
+		outcome := e.runAttempt(currentProcessor, txn.Amount, attemptNum)
 
-		// Call processor simulator.
-		start := time.Now()
-		result := e.simulator.Process(currentProcessor, txn.Amount)
-		elapsed := time.Since(start)
+		_ = e.store.AddAttempt(txn.ID, outcome.attempt)
 
-		attempt := model.Attempt{
-			Number:    attemptNum,
-			Processor: currentProcessor,
-			Duration:  elapsed,
-			DurationMs: float64(elapsed.Nanoseconds()) / 1e6,
-			Timestamp: time.Now(),
-		}
-
-		if result.Approved {
-			attempt.Status = "approved"
-			attempt.ResponseType = "approved"
-			_ = e.store.AddAttempt(txn.ID, attempt)
+		if outcome.approved {
 			_ = e.store.UpdateStatus(txn.ID, model.StatusApproved, currentProcessor, "", time.Now())
-
 			if e.health != nil {
 				e.health.Record(currentProcessor, true, false)
 			}
-
 			e.logger.Info("attempt succeeded",
 				"transaction_id", txn.ID,
 				"attempt", attemptNum,
 				"processor", currentProcessor,
-				"duration_ms", attempt.DurationMs,
+				"duration_ms", outcome.attempt.DurationMs,
 			)
-
 			return e.store.Get(txn.ID)
 		}
 
-		// Failed attempt.
-		attempt.Status = "failed"
-		attempt.ErrorType = result.ErrorType
-		attempt.ErrorMessage = result.ErrorMessage
-		lastError = result.ErrorMessage
-
-		// Determine retry action. Unknown error types default to abort (safe fallback).
-		action, ok := model.RetryRules[result.ErrorType]
-		if !ok {
-			action = model.ActionAbort
-		}
-		attempt.RetryAction = action
-
-		// Classify response: hard_decline for abort errors, soft_decline for retryable errors.
-		if action == model.ActionAbort {
-			attempt.ResponseType = "hard_decline"
-		} else {
-			attempt.ResponseType = "soft_decline"
-		}
-
-		_ = e.store.AddAttempt(txn.ID, attempt)
+		lastError = outcome.attempt.ErrorMessage
 
 		if e.health != nil {
-			e.health.Record(currentProcessor, false, result.ErrorType == model.ErrTimeout)
+			e.health.Record(currentProcessor, false, outcome.isTimeout)
 		}
 
 		e.logger.Info("attempt failed",
 			"transaction_id", txn.ID,
 			"attempt", attemptNum,
 			"processor", currentProcessor,
-			"error_type", result.ErrorType,
-			"error_message", result.ErrorMessage,
-			"retry_action", action,
-			"response_type", attempt.ResponseType,
-			"duration_ms", attempt.DurationMs,
+			"error_type", outcome.attempt.ErrorType,
+			"error_message", outcome.attempt.ErrorMessage,
+			"retry_action", outcome.action,
+			"response_type", outcome.attempt.ResponseType,
+			"duration_ms", outcome.attempt.DurationMs,
 		)
 
-		switch action {
+		switch outcome.action {
 		case model.ActionAbort:
-			// Hard decline — the card/account has a permanent problem, stop immediately.
-			_ = e.store.UpdateStatus(txn.ID, model.StatusDeclined, "", lastError, time.Now())
+			// Hard decline — stop immediately. Record which processor declined.
+			_ = e.store.UpdateStatus(txn.ID, model.StatusDeclined, currentProcessor, lastError, time.Now())
 			return e.store.Get(txn.ID)
 
 		case model.ActionSwitchProcessor:
 			// Advance to the next processor in the ordered fallback list.
 			processorIdx++
-			// Edge case: we've run through all processors but still have retry budget.
-			// Mark exhausted so the top-of-loop guard breaks on next iteration.
 			if processorIdx >= len(processors) && attemptNum < MaxAttempts {
 				lastError = "all processors exhausted"
 			}
@@ -177,9 +199,9 @@ func (e *Engine) Execute(req model.TransactionRequest) (*model.Transaction, erro
 			// Transient error — stay on current processor and retry after backoff.
 		}
 
-		// Exponential backoff: 500ms * 2^(attempt-1) → 500ms, 1s, 2s
+		// Exponential backoff with jitter.
 		if attemptNum < MaxAttempts && processorIdx < len(processors) {
-			backoff := time.Duration(BaseBackoffMs*(1<<(attemptNum-1))) * time.Millisecond
+			backoff := e.calcBackoff(attemptNum)
 			e.logger.Info("backoff",
 				"transaction_id", txn.ID,
 				"delay_ms", backoff.Milliseconds(),
