@@ -1,0 +1,22 @@
+# Challenge reference materials (not part of deliverable)
+challenge.md
+challenge-full-page.png
+
+# Browser automation artifacts
+.playwright-mcp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Go build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
