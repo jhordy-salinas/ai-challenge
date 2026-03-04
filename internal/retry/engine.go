@@ -149,10 +149,14 @@ func (e *Engine) Execute(req model.TransactionRequest) (*model.Transaction, erro
 		currentProcessor := processors[processorIdx]
 		outcome := e.runAttempt(currentProcessor, txn.Amount, attemptNum)
 
-		_ = e.store.AddAttempt(txn.ID, outcome.attempt)
+		if err := e.store.AddAttempt(txn.ID, outcome.attempt); err != nil {
+			e.logger.Error("failed to record attempt", "transaction_id", txn.ID, "error", err)
+		}
 
 		if outcome.approved {
-			_ = e.store.UpdateStatus(txn.ID, model.StatusApproved, currentProcessor, "", time.Now())
+			if err := e.store.UpdateStatus(txn.ID, model.StatusApproved, currentProcessor, "", time.Now()); err != nil {
+				e.logger.Error("failed to update status", "transaction_id", txn.ID, "error", err)
+			}
 			if e.health != nil {
 				e.health.Record(currentProcessor, true, false)
 			}
@@ -185,7 +189,9 @@ func (e *Engine) Execute(req model.TransactionRequest) (*model.Transaction, erro
 		switch outcome.action {
 		case model.ActionAbort:
 			// Hard decline — stop immediately. Record which processor declined.
-			_ = e.store.UpdateStatus(txn.ID, model.StatusDeclined, currentProcessor, lastError, time.Now())
+			if err := e.store.UpdateStatus(txn.ID, model.StatusDeclined, currentProcessor, lastError, time.Now()); err != nil {
+				e.logger.Error("failed to update status", "transaction_id", txn.ID, "error", err)
+			}
 			return e.store.Get(txn.ID)
 
 		case model.ActionSwitchProcessor:
@@ -211,6 +217,8 @@ func (e *Engine) Execute(req model.TransactionRequest) (*model.Transaction, erro
 	}
 
 	// All attempts exhausted.
-	_ = e.store.UpdateStatus(txn.ID, model.StatusFailed, "", lastError, time.Now())
+	if err := e.store.UpdateStatus(txn.ID, model.StatusFailed, "", lastError, time.Now()); err != nil {
+		e.logger.Error("failed to update status", "transaction_id", txn.ID, "error", err)
+	}
 	return e.store.Get(txn.ID)
 }

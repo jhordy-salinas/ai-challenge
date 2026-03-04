@@ -54,7 +54,7 @@ Creates a transaction and runs the retry orchestration loop synchronously.
 | `merchant_id` | Identifies the merchant for logging and analytics (e.g., `cloudmarket_mx`) |
 | `processor_order` | Ordered fallback list of processors: `StripeLatam`, `PayUSouth`, `EbanxBR` |
 
-**Response (200 / 422 / 502):**
+**Response (200 / 422 / 503):**
 ```json
 {
   "transaction_id": "txn_a1b2c3d4e5f6",
@@ -79,7 +79,7 @@ Error codes: `INVALID_JSON`, `INVALID_AMOUNT`, `MISSING_CURRENCY`, `MISSING_PAYM
 | 200    | Transaction approved |
 | 400    | Validation error (missing/invalid fields, unknown processor) |
 | 422    | Hard decline (card expired, insufficient funds, etc.) |
-| 502    | All retries exhausted |
+| 503    | All retries exhausted (service unavailable) |
 
 ### GET /transactions/{id}
 Returns full transaction with attempt history — each attempt includes processor, response type, error type, retry action taken, duration, and timestamp.
@@ -217,7 +217,7 @@ internal/
 ├── middleware/logging.go      Structured JSON request logging (slog)
 └── router/router.go           Chi router setup
 test/
-├── scenarios_test.go          12 table-driven retry behavior tests
+├── scenarios_test.go          13 table-driven retry behavior tests
 ├── concurrent_test.go         Concurrent transaction isolation tests
 └── http_test.go               HTTP integration tests (handlers, status codes, JSON)
 ```
@@ -268,4 +268,4 @@ A: Set the `PORT` environment variable: `PORT=3000 go run main.go`
 A: Processors are reordered by a composite health score (`success_rate - timeout_rate * 0.5`) computed over a 5-minute rolling window. Healthier processors are tried first. Unknown processors default to score 1.0.
 
 **Q: What if all processors are down?**
-A: The engine tries each processor in order, switching after timeouts or unavailability errors, and returns `502` with `"all processors exhausted"` once all have been attempted or max attempts reached.
+A: The engine tries each processor in order, switching after timeouts or unavailability errors, and returns `503` with `"all processors exhausted"` once all have been attempted or max attempts reached.

@@ -103,7 +103,7 @@ func (h *Handler) CreateTransaction(w http.ResponseWriter, r *http.Request) {
 	case model.StatusDeclined:
 		status = http.StatusUnprocessableEntity
 	case model.StatusFailed:
-		status = http.StatusBadGateway
+		status = http.StatusServiceUnavailable
 	}
 
 	writeJSON(w, status, resp)

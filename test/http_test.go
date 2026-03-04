@@ -95,8 +95,8 @@ func TestHTTPPostFailed(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("status = %d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}
 }
 
@@ -395,6 +395,26 @@ func TestHTTPErrorCodes(t *testing.T) {
 	}
 	if result["error"] != "amount must be positive" {
 		t.Errorf("error = %q, want 'amount must be positive'", result["error"])
+	}
+}
+
+func TestHTTPRequestIDHeader(t *testing.T) {
+	sim := processor.NewScriptedSimulator(map[string][]processor.ScriptedResponse{
+		"StripeLatam": {{Approved: true}},
+	})
+	srv := setupTestServer(sim)
+	defer srv.Close()
+
+	body := `{"amount":100,"currency":"MXN","payment_method":"card_visa_4242","merchant_id":"m1","processor_order":["StripeLatam"]}`
+	resp, err := http.Post(srv.URL+"/transactions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	reqID := resp.Header.Get("X-Request-Id")
+	if reqID == "" {
+		t.Error("X-Request-Id header is missing from response")
 	}
 }
 

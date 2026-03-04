@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 )
 
 // statusWriter captures the response status code.
@@ -35,4 +37,17 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+// RequestIDHeader copies chi's request ID into the X-Request-Id response header
+// so clients can correlate requests to server logs.
+func RequestIDHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reqID := r.Context().Value(chiMiddleware.RequestIDKey); reqID != nil {
+			if id, ok := reqID.(string); ok {
+				w.Header().Set("X-Request-Id", id)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

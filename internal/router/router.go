@@ -15,6 +15,7 @@ func New(h *handler.Handler, logger *slog.Logger) *chi.Mux {
 
 	r.Use(chiMiddleware.Recoverer)
 	r.Use(chiMiddleware.RequestID)
+	r.Use(middleware.RequestIDHeader)
 	r.Use(middleware.RequestLogger(logger))
 
 	r.Post("/transactions", h.CreateTransaction)
